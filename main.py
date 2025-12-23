@@ -1,16 +1,11 @@
 """
-main.py — Bronze Star inbound email parser -> Granot poster
+main.py — Bronze Star inbound email parser -> Granot poster (FIXED)
 
-What it does:
-- Accepts webhook payloads from GHL / Postman / anything.
-- Robustly reads request body as:
-    1) JSON (application/json)
-    2) form-data / x-www-form-urlencoded
-    3) raw text fallback
-- Extracts fields from the inbound email text (your "New Moving Lead" format)
-- Normalizes move date to MM/DD/YYYY (Granot requirement)
-- Sets servtypeid (101 if same-state, else 102)
-- Posts the structured lead to Granot using API_ID.
+Fixes:
+- Robust line-by-line parsing (no regex group bleed)
+- Correct dstate/dzip mapping (no more "MOVING STATE"/"Moving zip")
+- Email extraction cleaned (pulls first real email)
+- Works with JSON, form-data, or raw text
 
 Endpoints:
 - GET  /health
@@ -21,7 +16,7 @@ import os
 import re
 import json
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -32,18 +27,40 @@ app = FastAPI()
 GRANOT_BASE_URL = "https://lead.hellomoving.com/LEADSGWHTTP.lidgw"
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
+
+EMAIL_RE = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
+
+KEY_ALIASES = {
+    "email": ["email"],
+    "first_name": ["first name", "firstname", "first"],
+    "last_name": ["last name", "lastname", "last"],
+    "phone": ["phone", "phone number", "tel", "telephone"],
+    "move_date": ["move date", "move day", "moving date", "date"],
+    "origin_city": ["origin city", "from city", "pickup city"],
+    "origin_state": ["origin state", "from state", "pickup state"],
+    "origin_zip": ["origin zip", "from zip", "pickup zip", "origin zipcode", "origin postal code"],
+    "dest_city": ["moving city", "destination city", "to city", "dropoff city"],
+    "dest_state": ["moving state", "destination state", "to state", "dropoff state"],
+    "dest_zip": ["moving zip", "destination zip", "to zip", "dropoff zip", "destination zipcode", "destination postal code"],
+    "bedrooms": ["number of bedrooms", "bedrooms", "br"],
+    "home_type": ["home type", "housing type", "type"],
+}
+
+
 def _clean_text(s: str) -> str:
     if not s:
         return ""
+    # normalize HTML-ish artifacts
     s = s.replace("&nbsp;", " ")
-    # remove <mailto:...> artifacts
     s = re.sub(r"<mailto:.*?>", "", s, flags=re.IGNORECASE)
+    # normalize line endings
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # collapse weird double spaces
+    s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
-
-
-def _extract(pattern: str, text: str) -> str:
-    m = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
-    return m.group(1).strip() if m else ""
 
 
 def _parse_move_date(raw: str) -> str:
@@ -68,48 +85,98 @@ def _parse_move_date(raw: str) -> str:
 def _servtypeid(ostate: str, dstate: str) -> str:
     if ostate and dstate and ostate.upper() == dstate.upper():
         return "101"  # local
-    return "102"      # long distance / default
+    return "102"  # long distance / default
+
+
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
+def _normalize_state(s: str) -> str:
+    s = (s or "").strip().upper()
+    # keep just 2-letter states if present
+    if len(s) >= 2:
+        m = re.search(r"\b([A-Z]{2})\b", s)
+        if m:
+            return m.group(1)
+    return s[:2] if len(s) >= 2 else ""
+
+
+def _first_email(text: str) -> str:
+    m = EMAIL_RE.search(text or "")
+    return m.group(1).strip() if m else ""
+
+
+def _build_kv_from_lines(text: str) -> Dict[str, str]:
+    """
+    Parses:
+      Key: Value
+    into a dict with lowercase keys.
+    Only uses the first ':' per line.
+    """
+    kv: Dict[str, str] = {}
+    for raw_line in (text or "").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if not k:
+            continue
+        # keep first occurrence (lead emails sometimes repeat)
+        if k not in kv:
+            kv[k] = v
+    return kv
+
+
+def _get_by_alias(kv: Dict[str, str], canonical: str) -> str:
+    for alias in KEY_ALIASES.get(canonical, []):
+        if alias in kv and kv[alias]:
+            return kv[alias].strip()
+    return ""
 
 
 def parse_lead_from_text(text: str) -> Dict[str, str]:
     t = _clean_text(text)
+    kv = _build_kv_from_lines(t)
 
-    email = _extract(r"Email:\s*([^\s<]+)", t)
-    firstname = _extract(r"First name:\s*([^\r\n]+)", t)
-    lastname = _extract(r"Last name:\s*([^\r\n]+)", t)
-    phone_raw = _extract(r"Phone:\s*([0-9\-\(\)\s\+]+)", t)
+    # Pull raw values from kv
+    email_raw = _get_by_alias(kv, "email")
+    first_raw = _get_by_alias(kv, "first_name")
+    last_raw = _get_by_alias(kv, "last_name")
+    phone_raw = _get_by_alias(kv, "phone")
+    movedate_raw = _get_by_alias(kv, "move_date")
 
-    movedate_raw = _extract(r"Move date:\s*([0-9\/\-]+)", t)
+    ocity = _get_by_alias(kv, "origin_city")
+    ostate = _get_by_alias(kv, "origin_state")
+    ozip = _get_by_alias(kv, "origin_zip")
 
-    ocity = _extract(r"Origin city:\s*([^\r\n]+)", t)
-    ostate = _extract(r"Origin state:\s*([A-Za-z]{2})", t)
-    ozip = _extract(r"Origin zip:\s*([0-9]{5})", t)
+    dcity = _get_by_alias(kv, "dest_city")
+    dstate = _get_by_alias(kv, "dest_state")
+    dzip = _get_by_alias(kv, "dest_zip")
 
-    dcity = _extract(r"(Moving city|Destination city):\s*([^\r\n]+)", t)
-    # if regex above matched with group2 due to (Moving city|Destination city)
-    if dcity and re.match(r"^(moving city|destination city)$", dcity.strip(), re.IGNORECASE):
-        dcity = ""  # safety (shouldn't happen, but keeps it clean)
-    if not dcity:
-        dcity = _extract(r"Moving city:\s*([^\r\n]+)", t)
+    bedrooms = _get_by_alias(kv, "bedrooms")
+    home_type = _get_by_alias(kv, "home_type")
 
-    dstate = _extract(r"(Moving state|Destination state):\s*([A-Za-z]{2})", t)
-    if not dstate:
-        dstate = _extract(r"Moving state:\s*([A-Za-z]{2})", t)
-
-    dzip = _extract(r"(Moving zip|Destination zip):\s*([0-9]{5})", t)
-    if not dzip:
-        dzip = _extract(r"Moving zip:\s*([0-9]{5})", t)
-
-    bedrooms = _extract(r"Number of bedrooms:\s*([0-9]+)", t)
-    home_type = _extract(r"Home type:\s*([^\r\n]+)", t)
+    # Clean/normalize
+    email = _first_email(email_raw) or _first_email(t)
+    firstname = (first_raw or "").strip()
+    lastname = (last_raw or "").strip()
+    phone1 = _digits_only(phone_raw)
 
     movedte = _parse_move_date(movedate_raw)
-    servtype = _servtypeid(ostate, dstate)
 
-    # Clean phone to digits only
-    phone1 = re.sub(r"\D", "", phone_raw or "")
+    ostate2 = _normalize_state(ostate)
+    dstate2 = _normalize_state(dstate)
 
-    movesize = (f"{bedrooms} bedroom" if bedrooms else "").strip()
+    servtype = _servtypeid(ostate2, dstate2)
+
+    # movesize / notes
+    bedrooms_digits = _digits_only(bedrooms)
+    movesize = (f"{bedrooms_digits} bedroom" if bedrooms_digits else "").strip()
 
     notes_lines = []
     if home_type:
@@ -124,14 +191,14 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
         "lastname": lastname,
         "email": email,
         "phone1": phone1,
-        "movedte": movedte,          # REQUIRED by Granot
+        "movedte": movedte,  # REQUIRED by Granot
         "ocity": ocity,
-        "ostate": (ostate or "").upper(),
-        "ozip": ozip,
+        "ostate": ostate2,
+        "ozip": _digits_only(ozip)[:5],
         "dcity": dcity,
-        "dstate": (dstate or "").upper(),
-        "dzip": dzip,
-        "movesize": movesize[:20],   # keep short
+        "dstate": dstate2,
+        "dzip": _digits_only(dzip)[:5],
+        "movesize": movesize[:20],
         "label": "Bronze Star Inbound Email",
         "notes": notes_str,
         "consent": "1",
@@ -177,6 +244,10 @@ async def _read_request_any(req: Request) -> Dict[str, Any]:
     return data
 
 
+# ---------------------------
+# Routes
+# ---------------------------
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -215,6 +286,13 @@ async def inbound_bronze_email(req: Request):
                 "error": "Missing/invalid move date after parsing. Expecting Move date like 23/12/2025.",
                 "parsed": lead,
             },
+        )
+
+    # Basic sanity checks to avoid silent Granot discards
+    if not lead.get("phone1") and not lead.get("email"):
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "error": "Missing both phone and email after parsing.", "parsed": lead},
         )
 
     url = f"{GRANOT_BASE_URL}?API_ID={api_id}"
