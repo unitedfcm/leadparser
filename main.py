@@ -180,7 +180,7 @@ def parse_lead_from_email_text(text: str) -> Dict[str, str]:
         "dstate": dstate[:20],
         "dzip": dzip[:6],
         "movesize": movesize[:20],
-        "label": "Bronze Star Inbound Email"[:20],
+        "label": "MAX EXCLUSIVE"[:20],
         "notes": notes,
         "consent": "1",
     }
