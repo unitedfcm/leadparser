@@ -1,10 +1,10 @@
 """
-main.py — Bronze Star inbound email parser -> Granot poster (FIXED)
+main.py — Bronze Star inbound email parser -> Granot poster (FIXED v2)
 
 Fixes:
-- Robust line-by-line parsing (no regex group bleed)
-- Correct dstate/dzip mapping (no more "MOVING STATE"/"Moving zip")
-- Email extraction cleaned (pulls first real email)
+- Handles GHL sending literal "\\r\\n" inside the text field
+- Line-by-line parsing into a clean KV map
+- Correct field extraction and normalization
 - Works with JSON, form-data, or raw text
 
 Endpoints:
@@ -16,7 +16,7 @@ import os
 import re
 import json
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -25,11 +25,6 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 
 GRANOT_BASE_URL = "https://lead.hellomoving.com/LEADSGWHTTP.lidgw"
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
 
 EMAIL_RE = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
 
@@ -53,21 +48,41 @@ KEY_ALIASES = {
 def _clean_text(s: str) -> str:
     if not s:
         return ""
-    # normalize HTML-ish artifacts
+
+    # If GHL sends literal backslash sequences, normalize them first:
+    # "\\r\\n" -> newline, etc.
+    if "\\r\\n" in s or "\\n" in s or "\\r" in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+    # normalize html-ish artifacts
     s = s.replace("&nbsp;", " ")
     s = re.sub(r"<mailto:.*?>", "", s, flags=re.IGNORECASE)
-    # normalize line endings
+
+    # normalize actual CRLF too
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    # collapse weird double spaces
+
+    # collapse weird spaces
     s = re.sub(r"[ \t]+", " ", s)
+
     return s.strip()
 
 
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
+def _normalize_state(s: str) -> str:
+    s = (s or "").strip().upper()
+    m = re.search(r"\b([A-Z]{2})\b", s)
+    return m.group(1) if m else (s[:2] if len(s) >= 2 else "")
+
+
+def _first_email(text: str) -> str:
+    m = EMAIL_RE.search(text or "")
+    return m.group(1).strip() if m else ""
+
+
 def _parse_move_date(raw: str) -> str:
-    """
-    Incoming often DD/MM/YYYY (23/12/2025).
-    Granot wants MM/DD/YYYY.
-    """
     raw = (raw or "").strip()
     if not raw:
         return ""
@@ -84,36 +99,11 @@ def _parse_move_date(raw: str) -> str:
 
 def _servtypeid(ostate: str, dstate: str) -> str:
     if ostate and dstate and ostate.upper() == dstate.upper():
-        return "101"  # local
-    return "102"  # long distance / default
-
-
-def _digits_only(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
-
-
-def _normalize_state(s: str) -> str:
-    s = (s or "").strip().upper()
-    # keep just 2-letter states if present
-    if len(s) >= 2:
-        m = re.search(r"\b([A-Z]{2})\b", s)
-        if m:
-            return m.group(1)
-    return s[:2] if len(s) >= 2 else ""
-
-
-def _first_email(text: str) -> str:
-    m = EMAIL_RE.search(text or "")
-    return m.group(1).strip() if m else ""
+        return "101"
+    return "102"
 
 
 def _build_kv_from_lines(text: str) -> Dict[str, str]:
-    """
-    Parses:
-      Key: Value
-    into a dict with lowercase keys.
-    Only uses the first ':' per line.
-    """
     kv: Dict[str, str] = {}
     for raw_line in (text or "").split("\n"):
         line = raw_line.strip()
@@ -121,12 +111,13 @@ def _build_kv_from_lines(text: str) -> Dict[str, str]:
             continue
         if ":" not in line:
             continue
+
         k, v = line.split(":", 1)
         k = k.strip().lower()
         v = v.strip()
         if not k:
             continue
-        # keep first occurrence (lead emails sometimes repeat)
+
         if k not in kv:
             kv[k] = v
     return kv
@@ -143,7 +134,6 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
     t = _clean_text(text)
     kv = _build_kv_from_lines(t)
 
-    # Pull raw values from kv
     email_raw = _get_by_alias(kv, "email")
     first_raw = _get_by_alias(kv, "first_name")
     last_raw = _get_by_alias(kv, "last_name")
@@ -161,7 +151,6 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
     bedrooms = _get_by_alias(kv, "bedrooms")
     home_type = _get_by_alias(kv, "home_type")
 
-    # Clean/normalize
     email = _first_email(email_raw) or _first_email(t)
     firstname = (first_raw or "").strip()
     lastname = (last_raw or "").strip()
@@ -174,7 +163,6 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
 
     servtype = _servtypeid(ostate2, dstate2)
 
-    # movesize / notes
     bedrooms_digits = _digits_only(bedrooms)
     movesize = (f"{bedrooms_digits} bedroom" if bedrooms_digits else "").strip()
 
@@ -191,7 +179,7 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
         "lastname": lastname,
         "email": email,
         "phone1": phone1,
-        "movedte": movedte,  # REQUIRED by Granot
+        "movedte": movedte,
         "ocity": ocity,
         "ostate": ostate2,
         "ozip": _digits_only(ozip)[:5],
@@ -206,26 +194,19 @@ def parse_lead_from_text(text: str) -> Dict[str, str]:
 
 
 async def _read_request_any(req: Request) -> Dict[str, Any]:
-    """
-    Robustly accept:
-    - application/json
-    - multipart/form-data / x-www-form-urlencoded
-    - raw text
-    Returns a dict with at least 'text' when possible.
-    """
     raw = await req.body()
     raw_text = raw.decode("utf-8", errors="ignore").strip()
 
     data: Dict[str, Any] = {}
 
-    # 1) Try JSON
+    # Try JSON
     if raw_text:
         try:
             data = json.loads(raw_text)
         except Exception:
             data = {}
 
-    # 2) Try form data
+    # Try form
     if not data:
         try:
             form = await req.form()
@@ -233,20 +214,14 @@ async def _read_request_any(req: Request) -> Dict[str, Any]:
         except Exception:
             data = {}
 
-    # 3) If still nothing, treat raw body as text itself
+    # Fallback raw
     if not data and raw_text:
         data = {"text": raw_text}
 
-    # Helpful debug extras
     data["_raw_preview"] = raw_text[:400]
     data["_content_type"] = req.headers.get("content-type", "")
-
     return data
 
-
-# ---------------------------
-# Routes
-# ---------------------------
 
 @app.get("/health")
 def health():
@@ -257,7 +232,6 @@ def health():
 async def inbound_bronze_email(req: Request):
     data = await _read_request_any(req)
 
-    # pull api_id from payload or env
     api_id = (data.get("api_id") or os.getenv("GRANOT_API_ID", "")).strip()
     if not api_id:
         raise HTTPException(status_code=400, detail="Missing api_id or env var GRANOT_API_ID.")
@@ -277,7 +251,6 @@ async def inbound_bronze_email(req: Request):
 
     lead = parse_lead_from_text(text)
 
-    # Granot requires move date
     if not lead.get("movedte"):
         return JSONResponse(
             status_code=422,
@@ -288,7 +261,6 @@ async def inbound_bronze_email(req: Request):
             },
         )
 
-    # Basic sanity checks to avoid silent Granot discards
     if not lead.get("phone1") and not lead.get("email"):
         return JSONResponse(
             status_code=422,
@@ -298,7 +270,6 @@ async def inbound_bronze_email(req: Request):
     url = f"{GRANOT_BASE_URL}?API_ID={api_id}"
 
     async with httpx.AsyncClient(timeout=25) as client:
-        # Granot expects form post
         resp = await client.post(url, data=lead)
 
     return {
