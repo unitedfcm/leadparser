@@ -1,261 +1,243 @@
 """
-main.py — Bronze Star inbound email parser -> Granot lead post
+main.py — Bronze Star inbound email parser -> Granot direct post (FINAL)
+
+Granot doc requirements implemented:
+- Direct post URL must include ONLY API_ID and MOVERREF. (no other field names in URL)
+  https://lead.hellomoving.com/LEADSGWHTTP.lidgw?&API_ID=XXXX&MOVERREF=leads@company.com
+- movedte is mandatory and must be MM/DD/YYYY
+- Granot expects HTTP form POST fields
 
 Endpoints:
-- GET  /health                       -> {"ok": true}
-- POST /inbound/bronze-email         -> accepts JSON OR form/multipart (e.g., SendGrid Inbound Parse)
-                                      expects a "text" field (preferred) or "html" field.
-
-Env vars:
-- GRANOT_API_ID            (required) e.g., EA2890F15A60
-- GRANOT_MOVERREF          (recommended) mover software key (ask Granot support if unsure)
-- GRANOT_URL               (optional) default: https://www.granot.com/LEADSGWHTTP.lidgw
-- GRANOT_SERVTYPEID        (optional) default: 102
-- LABEL_DEFAULT            (optional) default: Bronze Star Inbound Email
-- CONSENT_DEFAULT          (optional) default: 1
+- GET  /health
+- POST /inbound/bronze-email
 """
-
-from __future__ import annotations
 
 import os
 import re
+import json
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
+GRANOT_BASE_URL = "https://lead.hellomoving.com/LEADSGWHTTP.lidgw"
 
-# -----------------------------
-# helpers
-# -----------------------------
-
-def _env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return v.strip() if isinstance(v, str) and v.strip() else default
+EMAIL_RE = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
 
 
-def _pick_first_nonempty(*vals: Optional[str]) -> str:
-    for v in vals:
-        if v and str(v).strip():
-            return str(v).strip()
-    return ""
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
 
+    # If GHL sends literal escaped sequences inside JSON strings, normalize them:
+    # "\\r\\n" -> "\n", etc.
+    if "\\r\\n" in s or "\\n" in s or "\\r" in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
 
-def _norm_whitespace(s: str) -> str:
+    # Normalize actual CRLF too
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    # collapse excessive blank lines
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+
+    # Remove common html-ish artifacts from inbound email bodies
+    s = s.replace("&nbsp;", " ")
+    s = re.sub(r"<mailto:.*?>", "", s, flags=re.IGNORECASE)
+
+    # Collapse whitespace
+    s = re.sub(r"[ \t]+", " ", s)
+
+    # Trim and keep stable newlines
+    s = "\n".join([ln.rstrip() for ln in s.split("\n")]).strip()
+
+    return s
 
 
-def _extract(text: str, label: str) -> str:
-    """
-    Extract 'Label: value' where label is case-insensitive.
-    Returns first match, stripped.
-    """
-    # Example: "Origin city: Akron"
-    pattern = rf"(?im)^\s*{re.escape(label)}\s*:\s*(.+?)\s*$"
-    m = re.search(pattern, text)
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
+def _normalize_state(s: str) -> str:
+    s = (s or "").strip().upper()
+    m = re.search(r"\b([A-Z]{2})\b", s)
+    return m.group(1) if m else (s[:2] if len(s) >= 2 else "")
+
+
+def _first_email(text: str) -> str:
+    m = EMAIL_RE.search(text or "")
     return m.group(1).strip() if m else ""
 
 
-def _extract_any(text: str, labels: Tuple[str, ...]) -> str:
-    for lab in labels:
-        v = _extract(text, lab)
-        if v:
-            return v
-    return ""
-
-
-def _extract_email(text: str) -> str:
-    # Prefer explicit "Email:" line
-    v = _extract_any(text, ("Email", "E-mail"))
-    if v:
-        # strip any mailto decorations accidentally carried into plain text
-        v = re.sub(r"<mailto:.*?>", "", v, flags=re.I).strip()
-        # if the value somehow includes extra words, keep first token that looks like email
-        m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", v, flags=re.I)
-        return m.group(1) if m else v
-
-    # fallback: first email-like in the body
-    m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, flags=re.I)
-    return m.group(1) if m else ""
-
-
-def _extract_phone(text: str) -> str:
-    v = _extract_any(text, ("Phone", "Phone number", "Telephone"))
-    if not v:
-        return ""
-    digits = re.sub(r"\D", "", v)
-    # keep US 10-digit if present; otherwise keep what we got
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits if len(digits) >= 10 else digits
-
-
-def _parse_move_date(text: str) -> str:
-    """
-    Input examples:
-      23/12/2025  (DD/MM/YYYY)  <- your source
-      12/23/2025  (MM/DD/YYYY)
-      2025-12-23
-    Output: MM/DD/YYYY (Granot)
-    """
-    raw = _extract_any(text, ("Move date", "Move Date", "Moving date", "Moving Date", "Pickup date", "Pickup Date"))
-    raw = raw.strip()
+def _parse_move_date_to_mmddyyyy(raw: str) -> str:
+    raw = (raw or "").strip()
     if not raw:
         return ""
 
-    raw = raw.replace(".", "/").replace("-", "/")
-    raw = re.sub(r"\s+", "", raw)
-
-    # Try DD/MM/YYYY first (because your feed uses that)
-    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+    # Your emails show DD/MM/YYYY (23/12/2025). Convert to MM/DD/YYYY.
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(raw, fmt)
             return dt.strftime("%m/%d/%Y")
-        except Exception:
-            pass
-
-    # last resort: find numbers like 23/12/2025 in the whole text
-    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
-    if m:
-        d1, d2, yy = m.group(1), m.group(2), m.group(3)
-        # assume DD/MM if first > 12
-        dd, mm = (d1, d2) if int(d1) > 12 else (d2, d1)
-        try:
-            dt = datetime(int(yy), int(mm), int(dd))
-            return dt.strftime("%m/%d/%Y")
-        except Exception:
-            return ""
+        except ValueError:
+            continue
 
     return ""
 
 
-def _movesize_from_bedrooms(text: str) -> str:
-    b = _extract_any(text, ("Number of bedrooms", "Bedrooms", "Bed rooms"))
-    b = b.strip()
-    if not b:
-        return ""
-    m = re.search(r"(\d+)", b)
-    if not m:
-        return ""
-    n = int(m.group(1))
-    if n <= 0:
-        return ""
-    return f"{n} bedroom"
+def _servtypeid(ostate: str, dstate: str) -> str:
+    # 101 local (same state) else 102 long distance
+    if ostate and dstate and ostate.upper() == dstate.upper():
+        return "101"
+    return "102"
 
 
-def _truncate(s: str, max_len: int) -> str:
-    s = s.strip()
-    return s if len(s) <= max_len else s[:max_len]
-
-
-async def _get_payload(req: Request) -> Dict[str, Any]:
+def _kv_from_lines(text: str) -> Dict[str, str]:
     """
-    Accept JSON, form-data, or multipart.
-    Returns dict.
+    Parses lines like:
+      "Email: x"
+      "First name: y"
+    into {"email":"x", "first name":"y", ...}
     """
-    # Try JSON first
-    try:
-        return await req.json()
-    except Exception:
-        pass
-
-    # Then try form
-    try:
-        form = await req.form()
-        return dict(form)
-    except Exception:
-        pass
-
-    # Nothing parseable
-    raw = (await req.body()) or b""
-    return {"_raw": raw.decode("utf-8", errors="replace")}
+    kv: Dict[str, str] = {}
+    for raw_line in (text or "").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k and k not in kv:
+            kv[k] = v
+    return kv
 
 
-def _build_granot_fields(text: str) -> Dict[str, str]:
-    text = _norm_whitespace(text)
+def _get(kv: Dict[str, str], *keys: str) -> str:
+    for k in keys:
+        kk = k.strip().lower()
+        if kk in kv and kv[kk]:
+            return kv[kk].strip()
+    return ""
 
-    firstname = _extract_any(text, ("First name", "First Name"))
-    lastname = _extract_any(text, ("Last name", "Last Name"))
-    email = _extract_email(text)
-    phone = _extract_phone(text)
 
-    movedte = _parse_move_date(text)
+def _parse_bedrooms_to_movesize(raw: str) -> str:
+    n = _digits_only(raw)
+    if not n:
+        return ""
+    # Keep short (doc says 20 chars for movesize)
+    return f"{n} bedroom"[:20]
 
-    ocity = _extract_any(text, ("Origin city", "Origin City"))
-    ostate = _extract_any(text, ("Origin state", "Origin State"))
-    ozip = _extract_any(text, ("Origin zip", "Origin Zip", "Origin zipcode", "Origin Postal Code"))
 
-    dcity = _extract_any(text, ("Moving city", "Moving City", "Destination city", "Destination City"))
-    dstate = _extract_any(text, ("Moving state", "Moving State", "Destination state", "Destination State"))
-    dzip = _extract_any(text, ("Moving zip", "Moving Zip", "Destination zip", "Destination Zip", "Destination zipcode"))
+def parse_lead_from_email_text(text: str) -> Dict[str, str]:
+    t = _clean_text(text)
+    kv = _kv_from_lines(t)
 
-    movesize = _movesize_from_bedrooms(text)
+    email_raw = _get(kv, "email")
+    firstname = _get(kv, "first name", "firstname")
+    lastname = _get(kv, "last name", "lastname")
+    phone_raw = _get(kv, "phone", "phone number")
+    move_date_raw = _get(kv, "move date", "moving date")
 
-    home_type = _extract_any(text, ("Home type", "Home Type"))
+    ocity = _get(kv, "origin city", "from city", "pickup city")
+    ostate = _normalize_state(_get(kv, "origin state", "from state", "pickup state"))
+    ozip = _digits_only(_get(kv, "origin zip", "from zip", "origin zipcode"))[:5]
 
-    notes_parts = []
+    dcity = _get(kv, "moving city", "destination city", "to city", "dropoff city")
+    dstate = _normalize_state(_get(kv, "moving state", "destination state", "to state", "dropoff state"))
+    dzip = _digits_only(_get(kv, "moving zip", "destination zip", "to zip", "destination zipcode"))[:5]
+
+    bedrooms_raw = _get(kv, "number of bedrooms", "bedrooms")
+    home_type = _get(kv, "home type")
+
+    # Fallback extraction (in case the "Email:" line is weird)
+    email = _first_email(email_raw) or _first_email(t)
+
+    phone1 = _digits_only(phone_raw)
+    movedte = _parse_move_date_to_mmddyyyy(move_date_raw)
+    servtypeid = _servtypeid(ostate, dstate)
+    movesize = _parse_bedrooms_to_movesize(bedrooms_raw)
+
+    notes_lines = []
     if home_type:
-        notes_parts.append(f"Home type: {home_type}")
-    notes_parts.append("---- RAW EMAIL TEXT ----\n" + text)
+        notes_lines.append(f"Home type: {home_type}")
+    notes_lines.append("---- RAW EMAIL TEXT ----")
+    notes_lines.append(t)
+    notes = "\n".join(notes_lines)
 
     return {
-        "firstname": firstname,
-        "lastname": lastname,
-        "email": email,
-        "phone1": phone,
-        "movedte": movedte,
-        "ocity": ocity,
-        "ostate": ostate,
-        "ozip": ozip,
-        "dcity": dcity,
-        "dstate": dstate,
-        "dzip": dzip,
-        "movesize": movesize,
-        "notes": "\n".join(notes_parts).strip(),
+        "servtypeid": servtypeid,
+        "firstname": firstname[:30],
+        "lastname": lastname[:30],
+        "email": email[:50],
+        "phone1": phone1[:20],
+        "movedte": movedte,            # REQUIRED (MM/DD/YYYY)
+        "ocity": ocity[:30],
+        "ostate": ostate[:20],
+        "ozip": ozip[:6],
+        "dcity": dcity[:20],
+        "dstate": dstate[:20],
+        "dzip": dzip[:6],
+        "movesize": movesize[:20],
+        "label": "Bronze Star Inbound Email"[:20],
+        "notes": notes,
+        "consent": "1",
     }
 
 
-def _parse_granot_response(resp_text: str) -> Dict[str, Any]:
+async def _read_request_any(req: Request) -> Dict[str, Any]:
     """
-    Typical response: leadid,errid,msg,sold,match
-    Example from docs: 104360,0,,0,0
-    You are getting: 0,0,,0,0  (leadid=0 => usually means it did not actually insert)
+    Accepts:
+    - application/json
+    - multipart/form-data / x-www-form-urlencoded
+    - raw text fallback
     """
-    raw = resp_text.strip()
-    parts = [p.strip() for p in raw.split(",")]
-    # Pad to 5
-    while len(parts) < 5:
-        parts.append("")
-    leadid, errid, msg, sold, match = parts[:5]
-    out = {
-        "leadid": leadid,
-        "errid": errid,
-        "msg": msg,
-        "sold": sold,
-        "match": match,
-        "raw": raw,
-    }
+    raw = await req.body()
+    raw_text = raw.decode("utf-8", errors="ignore")
+
+    data: Dict[str, Any] = {}
+
+    # Try JSON first if it looks like JSON
     try:
-        out["leadid_int"] = int(leadid) if leadid else 0
+        data = json.loads(raw_text) if raw_text.strip() else {}
     except Exception:
-        out["leadid_int"] = 0
-    try:
-        out["errid_int"] = int(errid) if errid else -1
-    except Exception:
-        out["errid_int"] = -1
+        data = {}
+
+    # Try form-data
+    if not data:
+        try:
+            form = await req.form()
+            data = dict(form)
+        except Exception:
+            data = {}
+
+    # Fallback: treat whole body as the text
+    if not data and raw_text.strip():
+        data = {"text": raw_text}
+
+    data["_raw_preview"] = (raw_text or "")[:500]
+    data["_content_type"] = req.headers.get("content-type", "")
+    return data
+
+
+def _parse_granot_response(resp_text: str) -> Dict[str, str]:
+    """
+    Granot HTTP response example: "104360,0,OK,6,6"
+    Format: leadid,errid,msg,sold,match
+    """
+    t = (resp_text or "").strip()
+    parts = [p.strip() for p in t.split(",")]
+    out = {"leadid": "", "errid": "", "msg": "", "sold": "", "match": "", "raw": t}
+
+    if len(parts) >= 5:
+        out["leadid"] = parts[0]
+        out["errid"] = parts[1]
+        out["msg"] = parts[2]
+        out["sold"] = parts[3]
+        out["match"] = parts[4]
     return out
 
-
-# -----------------------------
-# routes
-# -----------------------------
 
 @app.get("/health")
 def health():
@@ -264,113 +246,87 @@ def health():
 
 @app.post("/inbound/bronze-email")
 async def inbound_bronze_email(req: Request):
-    payload = await _get_payload(req)
+    data = await _read_request_any(req)
 
-    # The inbound webhook from GHL sends JSON, with the entire email body in payload["text"].
-    # SendGrid inbound parse will post "text" and/or "html" in multipart form.
-    raw_text = _pick_first_nonempty(
-        str(payload.get("text") or ""),
-        str(payload.get("Text") or ""),
-        str(payload.get("html") or ""),
-        str(payload.get("Html") or ""),
-        str(payload.get("_raw") or ""),
-    )
+    api_id = (data.get("api_id") or os.getenv("GRANOT_API_ID", "")).strip()
+    if not api_id:
+        raise HTTPException(status_code=400, detail="Missing GRANOT_API_ID (or api_id in payload).")
 
-    if not raw_text.strip():
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "error": "Missing text/html in request payload.", "payload_keys": sorted(payload.keys())},
-        )
+    moverref = (data.get("moverref") or os.getenv("GRANOT_MOVERREF", "")).strip()
+    if not moverref:
+        # If you want direct-to-mover posting, this is required.
+        # Granot can also accept marketplace posting without moverref,
+        # but your situation needs direct posting.
+        raise HTTPException(status_code=400, detail="Missing GRANOT_MOVERREF (or moverref in payload).")
 
-    fields = _build_granot_fields(raw_text)
-
-    # Validate minimal differentiation — must have at least email or phone for downstream GHL "Create Contact"
-    if not (fields.get("email") or fields.get("phone1")):
+    text = (data.get("text") or "")
+    if not str(text).strip():
         return JSONResponse(
             status_code=422,
-            content={"ok": False, "error": "Missing email and phone after parsing.", "parsed": fields},
+            content={
+                "ok": False,
+                "error": "No 'text' found in request. Send JSON {'text':'...'}",
+                "debug": {
+                    "content_type": data.get("_content_type", ""),
+                    "raw_preview": data.get("_raw_preview", ""),
+                    "received_keys": sorted([k for k in data.keys() if not k.startswith("_")]),
+                },
+            },
         )
 
-    # Granot requires a move date; if missing, fail loudly (your earlier error)
-    if not fields.get("movedte"):
+    lead = parse_lead_from_email_text(str(text))
+
+    # Hard requirements per Granot docs:
+    if not lead.get("movedte"):
         return JSONResponse(
             status_code=422,
             content={
                 "ok": False,
                 "error": "Missing/invalid move date after parsing. Expecting Move date like 23/12/2025.",
-                "parsed": fields,
+                "parsed": lead,
             },
         )
 
-    api_id = _env("GRANOT_API_ID")
-    if not api_id:
-        return JSONResponse(status_code=500, content={"ok": False, "error": "GRANOT_API_ID env var missing."})
-
-    moverref = _env("GRANOT_MOVERREF")  # strongly recommended
-    base_url = _env("GRANOT_URL", "https://www.granot.com/LEADSGWHTTP.lidgw")
-    servtypeid = _env("GRANOT_SERVTYPEID", "102")
-    label = _truncate(_env("LABEL_DEFAULT", "Bronze Star Inbound Email"), 20)
-    consent = _env("CONSENT_DEFAULT", "1")
-
-    post_fields = {
-        "servtypeid": servtypeid,
-        "firstname": fields["firstname"],
-        "lastname": fields["lastname"],
-        "email": fields["email"],
-        "phone1": fields["phone1"],
-        "movedte": fields["movedte"],
-        "ocity": fields["ocity"],
-        "ostate": fields["ostate"],
-        "ozip": fields["ozip"],
-        "dcity": fields["dcity"],
-        "dstate": fields["dstate"],
-        "dzip": fields["dzip"],
-        "movesize": fields["movesize"],
-        "label": label,
-        "notes": fields["notes"],
-        "consent": consent,
-    }
-
-    # Build URL: docs indicate ONLY API_ID and MOVERREF should be in query for direct posting into mover software.
-    # If you omit MOVERREF, Granot may accept the post but not insert it into your mover's lead table (leadid=0).
-    url = f"{base_url}?API_ID={api_id}"
-    if moverref:
-        url += f"&MOVERREF={moverref}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, data=post_fields)
-        granot_status = r.status_code
-        granot_text = (r.text or "").strip()
-
-    parsed_resp = _parse_granot_response(granot_text)
-
-    # Consider it "success" only if errid==0 AND leadid>0
-    ok = (parsed_resp.get("errid_int") == 0) and (parsed_resp.get("leadid_int", 0) > 0)
-
-    # If errid==0 but leadid==0, return ok=false with a clear hint: MOVERREF is likely missing/wrong.
-    if parsed_resp.get("errid_int") == 0 and parsed_resp.get("leadid_int", 0) == 0:
+    # Must have at least one contact method (Granot error 15 if missing both) — doc shows phone/email recommended.
+    if not lead.get("phone1") and not lead.get("email"):
         return JSONResponse(
-            status_code=200,
+            status_code=422,
+            content={"ok": False, "error": "Missing both phone and email after parsing.", "parsed": lead},
+        )
+
+    # Ensure states are present because Granot can error on missing from/to state (err 17/18)
+    if not lead.get("ostate") or not lead.get("dstate"):
+        return JSONResponse(
+            status_code=422,
             content={
                 "ok": False,
-                "warning": "Granot returned errid=0 but leadid=0. This usually means the post was accepted but NOT inserted into your mover's system. Verify GRANOT_MOVERREF (lead email key) with Granot support.",
-                "granot_status": granot_status,
-                "granot_response": parsed_resp,
-                "posted": post_fields,
+                "error": "Missing origin/destination state after parsing (Origin state / Moving state).",
+                "parsed": lead,
             },
         )
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "ok": ok,
-            "granot_status": granot_status,
-            "granot_response": parsed_resp,
-            "posted": post_fields,
+    # Doc: direct post URL must contain ONLY API_ID + MOVERREF
+    url = f"{GRANOT_BASE_URL}?&API_ID={api_id}&MOVERREF={moverref}"
+
+    # Doc: moverref is optional in POST body IF provided on URL.
+    # We'll include it anyway; it does not violate the "URL only" rule.
+    lead_for_post = dict(lead)
+    lead_for_post["moverref"] = moverref
+
+    async with httpx.AsyncClient(timeout=25) as client:
+        # Granot expects form post
+        resp = await client.post(url, data=lead_for_post)
+
+    granot_parsed = _parse_granot_response(resp.text)
+
+    return {
+        "ok": resp.status_code == 200 and (granot_parsed.get("errid") in ("", "0")),
+        "granot_status": resp.status_code,
+        "granot_parsed": granot_parsed,
+        "posted": lead_for_post,
+        "debug": {
+            "content_type": data.get("_content_type", ""),
+            "raw_preview": data.get("_raw_preview", ""),
+            "post_url_has_only": "API_ID + MOVERREF",
         },
-    )
-
-
-@app.post("/bronze-email")
-async def bronze_email_alias(req: Request):
-    return await inbound_bronze_email(req)
+    }
